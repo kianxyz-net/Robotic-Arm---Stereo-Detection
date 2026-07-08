@@ -157,81 +157,166 @@ namespace BoxDetect
             BoundingBox.Y + BoundingBox.Height / 2f);
     }
 
-    // Color-based detection - detects green and red boxes
+    // ===========================================================================
+    // Hierarchical multi-color detector with per-color size thresholds
+    // ---------------------------------------------------------------------------
+    // Priority order (first match wins):
+    //   1. WHITE      -> teaType 1 (green category)
+    //   2. CARDBOARD  -> teaType 2 (red category)
+    //   3. RED        -> teaType 2 (red category)
+    //   4. GREEN      -> teaType 1 (green category)
+    //   5. ORANGE     -> teaType 1 (green category)
+    //   6. BLACK      -> teaType 2 (red category)
+    //   7. PURPLE     -> teaType 2 (red category)
+    //
+    // Per-color MinArea: background-prone colors (white/black/cardboard) require
+    // MUCH larger blobs to trigger. Target colors keep tight thresholds so they
+    // still fire reliably on actual small/medium boxes.
+    //
+    // HSV ranges tuned for well-lit indoor/office lighting.
+    // OpenCV HSV: H 0-179, S 0-255, V 0-255
+    // ===========================================================================
     public class ColorDetector
     {
-        // Green HSV range (TeaType = 1)
-        private readonly Scalar _lowerGreen = new Scalar(35, 60, 40);
-        private readonly Scalar _upperGreen = new Scalar(90, 255, 255);
+        // Real target boxes: red/green/orange are ~10-20k px, white/cardboard/black/purple are 1/4-1/2 of that (~2.5-10k px).
+        // So MinArea can't be too high on the smaller-box colors -- must rely on TIGHT HSV instead.
 
-        // Red HSV range (TeaType = 2) - red wraps around 0/180
-        // Higher saturation min (150) filters out silver/metallic reflections
+        // ---- WHITE ----
+        // Very strict HSV: V>=230 (only truly bright), S<=25 (only truly neutral).
+        // Most off-white/paper/desk surfaces don't meet BOTH conditions simultaneously.
+        private readonly Scalar _lowerWhite = new Scalar(0, 0, 230);
+        private readonly Scalar _upperWhite = new Scalar(179, 25, 255);
+        private const int MinAreaWhite = 2500;   // Low enough for smaller white boxes
+
+        // ---- CARDBOARD (light brown/tan) ----
+        // S range 60-120 (was 40-150). Cutting the low-S end rejects gray/beige backgrounds,
+        // cutting the high-S end keeps a big gap from orange (which starts at 150).
+        private readonly Scalar _lowerCardboard = new Scalar(8, 60, 80);
+        private readonly Scalar _upperCardboard = new Scalar(22, 120, 190);
+        private const int MinAreaCardboard = 2000;  // Low enough for smaller cardboard boxes
+
+        // ---- RED ----
+        // Two ranges (hue wraps around 0/180). High S floor rejects pinks.
         private readonly Scalar _lowerRed1 = new Scalar(0, 150, 60);
         private readonly Scalar _upperRed1 = new Scalar(10, 255, 255);
         private readonly Scalar _lowerRed2 = new Scalar(170, 150, 60);
         private readonly Scalar _upperRed2 = new Scalar(180, 255, 255);
+        private const int MinAreaRed = 1500;
 
-        // Minimum contour area
+        // ---- GREEN ----
+        private readonly Scalar _lowerGreen = new Scalar(35, 60, 40);
+        private readonly Scalar _upperGreen = new Scalar(90, 255, 255);
+        private const int MinAreaGreen = 1500;
+
+        // ---- ORANGE ----
+        // Requires S>=150 (cardboard tops out at 120, so 30-unit safety gap).
+        private readonly Scalar _lowerOrange = new Scalar(10, 150, 100);
+        private readonly Scalar _upperOrange = new Scalar(22, 255, 255);
+        private const int MinAreaOrange = 1500;
+
+        // ---- BLACK ----
+        // Very strict V<=30 (was 40, then 50). Real black boxes still hit this;
+        // shadows/dark surfaces usually sit at V 30-60.
+        private readonly Scalar _lowerBlack = new Scalar(0, 0, 0);
+        private readonly Scalar _upperBlack = new Scalar(179, 255, 30);
+        private const int MinAreaBlack = 2000;   // Low enough for smaller black boxes
+
+        // ---- PURPLE ----
+        private readonly Scalar _lowerPurple = new Scalar(125, 60, 40);
+        private readonly Scalar _upperPurple = new Scalar(155, 255, 255);
+        private const int MinAreaPurple = 1500;
+
+        // Legacy field kept for backward compatibility - no longer used internally
         public int MinArea { get; set; } = 1500;
 
         /// <summary>
-        /// Detect green OR red box. Prioritizes green - only looks for red if no green found.
-        /// Returns teaType: 0=none, 1=green, 2=red
+        /// Detect the highest-priority color present in the frame.
+        /// Each color uses its own MinArea threshold - background-prone colors
+        /// (white/black/cardboard) require much bigger blobs than target colors.
+        /// Returns teaType: 0=none, 1=green cat (white/green/orange), 2=red cat (cardboard/red/black/purple)
         /// </summary>
         public (bool found, float cx, float cy, int teaType, Mat mask) DetectColor(Mat frame)
         {
-            // Blur BEFORE HSV - smears color into text/barcode areas
             using var blurred = new Mat();
             Cv2.GaussianBlur(frame, blurred, new Size(15, 15), 0);
 
             using var hsv = new Mat();
             Cv2.CvtColor(blurred, hsv, ColorConversionCodes.BGR2HSV);
 
-            // Try green first
-            var greenMask = new Mat();
-            Cv2.InRange(hsv, _lowerGreen, _upperGreen, greenMask);
+            // 1. WHITE -> teaType 1
+            var result = TryDetect(hsv, _lowerWhite, _upperWhite, MinAreaWhite);
+            if (result.found) return (true, result.cx, result.cy, 1, result.mask);
+            result.mask.Dispose();
 
-            using var openKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(5, 5));
-            using var closeKernel = Cv2.GetStructuringElement(MorphShapes.Ellipse, new Size(35, 35));
-            Cv2.MorphologyEx(greenMask, greenMask, MorphTypes.Open, openKernel);    // Remove noise
-            Cv2.MorphologyEx(greenMask, greenMask, MorphTypes.Close, closeKernel);  // Fill holes
-            Cv2.GaussianBlur(greenMask, greenMask, new Size(5, 5), 0);
-            Cv2.Threshold(greenMask, greenMask, 127, 255, ThresholdTypes.Binary);   // Re-threshold
+            // 2. CARDBOARD -> teaType 2
+            result = TryDetect(hsv, _lowerCardboard, _upperCardboard, MinAreaCardboard);
+            if (result.found) return (true, result.cx, result.cy, 2, result.mask);
+            result.mask.Dispose();
 
-            var (greenFound, greenCx, greenCy, greenArea) = FindLargestContour(greenMask);
+            // 3. RED (dual range) -> teaType 2
+            var redResult = TryDetectDualRange(hsv, _lowerRed1, _upperRed1, _lowerRed2, _upperRed2, MinAreaRed);
+            if (redResult.found) return (true, redResult.cx, redResult.cy, 2, redResult.mask);
+            redResult.mask.Dispose();
 
-            // If green found, return it
-            if (greenFound)
-            {
-                return (true, greenCx, greenCy, 1, greenMask);  // TeaType = 1 (green)
-            }
+            // 4. GREEN -> teaType 1
+            result = TryDetect(hsv, _lowerGreen, _upperGreen, MinAreaGreen);
+            if (result.found) return (true, result.cx, result.cy, 1, result.mask);
+            result.mask.Dispose();
 
-            // No green - try red
-            greenMask.Dispose();
+            // 5. ORANGE -> teaType 1
+            result = TryDetect(hsv, _lowerOrange, _upperOrange, MinAreaOrange);
+            if (result.found) return (true, result.cx, result.cy, 1, result.mask);
+            result.mask.Dispose();
 
-            using var redMask1 = new Mat();
-            using var redMask2 = new Mat();
-            Cv2.InRange(hsv, _lowerRed1, _upperRed1, redMask1);
-            Cv2.InRange(hsv, _lowerRed2, _upperRed2, redMask2);
-            var redMask = new Mat();
-            Cv2.BitwiseOr(redMask1, redMask2, redMask);
+            // 6. BLACK -> teaType 2
+            result = TryDetect(hsv, _lowerBlack, _upperBlack, MinAreaBlack);
+            if (result.found) return (true, result.cx, result.cy, 2, result.mask);
+            result.mask.Dispose();
 
-            Cv2.MorphologyEx(redMask, redMask, MorphTypes.Open, openKernel);
-            Cv2.MorphologyEx(redMask, redMask, MorphTypes.Close, closeKernel);
-            Cv2.GaussianBlur(redMask, redMask, new Size(5, 5), 0);
-            Cv2.Threshold(redMask, redMask, 127, 255, ThresholdTypes.Binary);
+            // 7. PURPLE -> teaType 2
+            result = TryDetect(hsv, _lowerPurple, _upperPurple, MinAreaPurple);
+            if (result.found) return (true, result.cx, result.cy, 2, result.mask);
 
-            var (redFound, redCx, redCy, redArea) = FindLargestContour(redMask);
-
-            if (redFound)
-            {
-                return (true, redCx, redCy, 2, redMask);  // TeaType = 2 (red)
-            }
-
-            return (false, 0, 0, 0, redMask);  // No detection
+            return (false, 0, 0, 0, result.mask);
         }
 
-        private (bool found, float cx, float cy, double area) FindLargestContour(Mat mask)
+        // Single-range detection with per-color min area
+        private (bool found, float cx, float cy, Mat mask) TryDetect(Mat hsv, Scalar lower, Scalar upper, int minArea)
+        {
+            var mask = new Mat();
+            Cv2.InRange(hsv, lower, upper, mask);
+            ApplyMorphology(mask);
+            var (found, cx, cy, _) = FindLargestContour(mask, minArea);
+            return (found, cx, cy, mask);
+        }
+
+        // Dual-range detection (used for red hue wraparound)
+        private (bool found, float cx, float cy, Mat mask) TryDetectDualRange(
+            Mat hsv, Scalar l1, Scalar u1, Scalar l2, Scalar u2, int minArea)
+        {
+            using var m1 = new Mat();
+            using var m2 = new Mat();
+            Cv2.InRange(hsv, l1, u1, m1);
+            Cv2.InRange(hsv, l2, u2, m2);
+            var mask = new Mat();
+            Cv2.BitwiseOr(m1, m2, mask);
+            ApplyMorphology(mask);
+            var (found, cx, cy, _) = FindLargestContour(mask, minArea);
+            return (found, cx, cy, mask);
+        }
+
+        // Clean up mask: remove noise, fill holes, re-binarize
+        private void ApplyMorphology(Mat mask)
+        {
+            using var openKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(5, 5));
+            using var closeKernel = Cv2.GetStructuringElement(MorphShapes.Ellipse, new Size(35, 35));
+            Cv2.MorphologyEx(mask, mask, MorphTypes.Open, openKernel);
+            Cv2.MorphologyEx(mask, mask, MorphTypes.Close, closeKernel);
+            Cv2.GaussianBlur(mask, mask, new Size(5, 5), 0);
+            Cv2.Threshold(mask, mask, 127, 255, ThresholdTypes.Binary);
+        }
+
+        private (bool found, float cx, float cy, double area) FindLargestContour(Mat mask, int minArea)
         {
             Cv2.FindContours(mask, out Point[][] contours, out _, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
 
@@ -250,7 +335,7 @@ namespace BoxDetect
                 }
             }
 
-            if (largest == null || maxArea < MinArea)
+            if (largest == null || maxArea < minArea)
                 return (false, 0, 0, 0);
 
             var hull = Cv2.ConvexHull(largest);
@@ -265,11 +350,18 @@ namespace BoxDetect
             return (true, cx, cy, maxArea);
         }
 
-        // Keep old method for compatibility with calibration
+        // Green-only detection (for hand-eye calibration - uses green pattern object)
+        // Intentionally scoped to green only, ignoring white/orange even though they share teaType 1
         public (bool found, float cx, float cy, Mat mask) DetectGreen(Mat frame)
         {
-            var (found, cx, cy, teaType, mask) = DetectColor(frame);
-            return (found && teaType == 1, cx, cy, mask);
+            using var blurred = new Mat();
+            Cv2.GaussianBlur(frame, blurred, new Size(15, 15), 0);
+
+            using var hsv = new Mat();
+            Cv2.CvtColor(blurred, hsv, ColorConversionCodes.BGR2HSV);
+
+            var result = TryDetect(hsv, _lowerGreen, _upperGreen, MinAreaGreen);
+            return (result.found, result.cx, result.cy, result.mask);
         }
     }
 
@@ -278,9 +370,9 @@ namespace BoxDetect
         private const string CalibFile = "stereo_calib.xml";
         private const string DepthCalibFile = "depth_calib.xml";
 
-        private readonly int cornersX = 9;   // 10 squares - 1 = 9 inner corners (long side)
-        private readonly int cornersY = 6;   // 7 squares - 1 = 6 inner corners (short side)
-        private readonly float squareSize = 20f;  // 0.02 meters = 20mm
+        private readonly int cornersX = 9;
+        private readonly int cornersY = 6;
+        private readonly float squareSize = 20f;
 
         private Mat? K1, K2;
         private Mat? D1, D2;
@@ -297,33 +389,26 @@ namespace BoxDetect
         public bool IsCapturing { get; private set; }
         public int CaptureCount => captures.Count;
 
-        // Depth calibration: Z_real = DepthScale / (disparity + DepthOffset)
-        private double DepthScale = 0;  // A coefficient
-        private double DepthOffset = 0; // B coefficient
+        private double DepthScale = 0;
+        private double DepthOffset = 0;
         public bool IsDepthCalibrated { get; private set; }
         public bool IsDepthCalibrating { get; private set; }
-        public bool QuietMode { get; set; } = false;  // Suppress console output during calibration
+        public bool QuietMode { get; set; } = false;
         private List<(double disparity, double actualDistance)> depthSamples = new();
 
-        // Robot transform calibration - collected during depth calibration
-        // Point correspondences: camera coords -> robot coords
         private List<(double cx, double cy, double cz, double rx, double ry, double rz)> pointCorrespondences = new();
-        // Rotation matrix (3x3) stored as array
-        public double[] RotationMatrix { get; private set; } = new double[9] { 1, 0, 0, 0, 1, 0, 0, 0, 1 }; // Identity default
-        // Translation vector
+        public double[] RotationMatrix { get; private set; } = new double[9] { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
         public double TranslationX { get; private set; } = 0;
         public double TranslationY { get; private set; } = 0;
         public double TranslationZ { get; private set; } = 0;
         public bool HasRobotTransform { get; private set; } = false;
 
-        // Expose camera matrix for robot calibration
         public Mat? GetK1() => K1;
         public Mat? GetD1() => D1;
 
-        // Get focal length from Q matrix (for height calculations)
         public double GetFocalLength()
         {
-            if (Q == null) return 600;  // Fallback default
+            if (Q == null) return 600;
             return Q.At<double>(2, 3);
         }
 
@@ -408,12 +493,10 @@ namespace BoxDetect
                     }
                 }
 
-                // Keep Point arrays for StereoCalibrate (uses different overload)
                 var objPtsList = new List<IEnumerable<Point3f>>();
                 var img1PtsList = new List<IEnumerable<Point2f>>();
                 var img2PtsList = new List<IEnumerable<Point2f>>();
 
-                // Also create Mat arrays for CalibrateCamera
                 var allObjPts = new Mat[captures.Count];
                 var allImg1Pts = new Mat[captures.Count];
                 var allImg2Pts = new Mat[captures.Count];
@@ -422,12 +505,10 @@ namespace BoxDetect
                 {
                     var (corners1, corners2) = captures[i];
 
-                    // For StereoCalibrate - use Point arrays
                     objPtsList.Add(objPts);
                     img1PtsList.Add(corners1);
                     img2PtsList.Add(corners2);
 
-                    // For CalibrateCamera - create Nx1 Mats
                     var objMat = new Mat(objPts.Length, 1, MatType.CV_32FC3);
                     for (int j = 0; j < objPts.Length; j++)
                     {
@@ -472,7 +553,6 @@ namespace BoxDetect
                 Mat E = new Mat();
                 Mat F = new Mat();
 
-                // Convert K and D to double arrays for the Point-based overload
                 var K1_arr = new double[3, 3];
                 var K2_arr = new double[3, 3];
                 for (int row = 0; row < 3; row++)
@@ -491,7 +571,6 @@ namespace BoxDetect
                     D2_arr[j] = D2.At<double>(0, j);
                 }
 
-                // Use the Point-based overload (avoids InputArray issues)
                 double stereoRms = Cv2.StereoCalibrate(
                     objPtsList,
                     img1PtsList,
@@ -503,7 +582,6 @@ namespace BoxDetect
                     new TermCriteria(CriteriaTypes.Eps | CriteriaTypes.MaxIter, 100, 1e-5)
                 );
 
-                // Copy results back to Mat
                 for (int row = 0; row < 3; row++)
                 {
                     for (int col = 0; col < 3; col++)
@@ -538,14 +616,10 @@ namespace BoxDetect
                 P1 = new Mat(); P2 = new Mat();
                 Q = new Mat();
 
-                // alpha=-1 lets OpenCV choose optimal value
-                // alpha=0 crops to valid region only
-                // alpha=1 keeps all pixels (caused blank images - too extreme)
                 Cv2.StereoRectify(K1, D1, K2, D2, imageSize, R, T,
                     R1, R2, P1, P2, Q,
                     StereoRectificationFlags.ZeroDisparity, -1, imageSize);
 
-                // Debug Q matrix
                 double f = Q.At<double>(2, 3);
                 double Tx = 1.0 / Q.At<double>(3, 2);
                 Console.WriteLine($"Q matrix: focal={f:F1}px, Tx={Tx:F1}mm");
@@ -553,8 +627,6 @@ namespace BoxDetect
                 Console.WriteLine($"Expected disparity at 1500mm: {f * baseline / 1500:F1}px");
                 Console.WriteLine($"Expected disparity at 2000mm: {f * baseline / 2000:F1}px");
 
-                // Show effective depth range based on stereo matcher settings
-                // numDisparities=256 at full scale
                 double minDepth = f * baseline / 256;
                 Console.WriteLine($"Stereo matching: min depth ~{minDepth:F0}mm (objects closer than this won't be detected)");
 
@@ -582,18 +654,11 @@ namespace BoxDetect
 
         private void InitStereoMatcher()
         {
-            // Full resolution matching
             stereoMatcher = StereoSGBM.Create(
-                0,              // minDisparity
-                256,            // numDisparities - max practical at full res
-                5,              // blockSize
-                8 * 3 * 5 * 5,  // p1 = 600
-                32 * 3 * 5 * 5, // p2 = 2400
-                1,              // disp12MaxDiff
-                63,             // preFilterCap
-                5,              // uniquenessRatio
-                100,            // speckleWindowSize
-                2,              // speckleRange
+                0, 256, 5,
+                8 * 3 * 5 * 5,
+                32 * 3 * 5 * 5,
+                1, 63, 5, 100, 2,
                 StereoSGBMMode.HH
             );
         }
@@ -614,18 +679,15 @@ namespace BoxDetect
             Cv2.CvtColor(r1, g1, ColorConversionCodes.BGR2GRAY);
             Cv2.CvtColor(r2, g2, ColorConversionCodes.BGR2GRAY);
 
-            // Compute disparity at full resolution
             var disparity = new Mat();
             stereoMatcher.Compute(g1, g2, disparity);
 
-            // Simple median blur to reduce noise
             using var temp = disparity.Clone();
             Cv2.MedianBlur(temp, disparity, 5);
 
             return disparity;
         }
 
-        // Save rectified images with horizontal lines to verify rectification quality
         public void SaveRectifiedImages(Mat frame1, Mat frame2)
         {
             if (!IsCalibrated || map1x == null || map1y == null || map2x == null || map2y == null)
@@ -639,19 +701,16 @@ namespace BoxDetect
             Cv2.Remap(frame1, r1, map1x, map1y, InterpolationFlags.Linear);
             Cv2.Remap(frame2, r2, map2x, map2y, InterpolationFlags.Linear);
 
-            // Create side-by-side image
             using var combined = new Mat(r1.Height, r1.Width * 2, r1.Type());
             r1.CopyTo(combined[new Rect(0, 0, r1.Width, r1.Height)]);
             r2.CopyTo(combined[new Rect(r1.Width, 0, r2.Width, r2.Height)]);
 
-            // Draw horizontal lines every 40 pixels
             for (int y = 0; y < combined.Height; y += 40)
             {
                 Cv2.Line(combined, new Point(0, y), new Point(combined.Width, y),
                     new Scalar(0, 255, 0), 1);
             }
 
-            // Draw vertical line at the seam
             Cv2.Line(combined, new Point(r1.Width, 0), new Point(r1.Width, combined.Height),
                 new Scalar(0, 0, 255), 2);
 
@@ -659,7 +718,6 @@ namespace BoxDetect
             Console.WriteLine("Saved rectified_pair.png - check if features align on horizontal lines!");
         }
 
-        // Get rectified frames for color detection (caller must dispose)
         public (Mat? rect1, Mat? rect2) RectifyFrames(Mat frame1, Mat frame2)
         {
             if (!IsCalibrated || map1x == null || map1y == null || map2x == null || map2y == null)
@@ -704,14 +762,12 @@ namespace BoxDetect
             if (!IsCalibrated || K1 == null || P1 == null || P2 == null || Q == null || T == null || disparity.Empty())
                 return false;
 
-            // Use Q matrix for 3D reprojection (consistent with GetDepthAtPoint)
-            // Q matrix structure: Q[0,3] = -cx, Q[1,3] = -cy, Q[2,3] = f
-            double cx = -Q.At<double>(0, 3);  // Principal point x (rectified)
-            double cy = -Q.At<double>(1, 3);  // Principal point y (rectified)
-            double f = Q.At<double>(2, 3);    // Focal length
-            double fx = f;  // Q uses single focal length (assumes fx=fy after rectification)
+            double cx = -Q.At<double>(0, 3);
+            double cy = -Q.At<double>(1, 3);
+            double f = Q.At<double>(2, 3);
+            double fx = f;
             double fy = f;
-            double p2_03 = P2.At<double>(0, 3);  // = -(Tx * f) for depth calculation
+            double p2_03 = P2.At<double>(0, 3);
 
             if (!_depthDiagPrinted)
             {
@@ -724,11 +780,9 @@ namespace BoxDetect
                 _depthDiagPrinted = true;
             }
 
-            // Convert disparity to float
             using var dispFloat = new Mat();
             disparity.ConvertTo(dispFloat, MatType.CV_32F, 1.0 / 16.0);
 
-            // Sample only center 50% of bounding box to avoid edges/background
             int marginX = box.Width / 4;
             int marginY = box.Height / 4;
             Rect innerBox = new Rect(
@@ -753,28 +807,22 @@ namespace BoxDetect
 
                     float d = dispFloat.At<float>(yy, xx);
 
-                    // Need positive disparity for valid depth
                     if (d <= 0) continue;
 
                     disparities.Add(d);
 
-                    // Depth calculation - use empirical calibration if available
                     float pz;
                     if (IsDepthCalibrated)
                     {
-                        // Use empirically calibrated formula: Z = Scale / (d + Offset)
                         pz = (float)ApplyDepthCalibration(d);
                     }
                     else
                     {
-                        // Fall back to theoretical: Z = -P2[0,3] / disparity
                         pz = (float)(-p2_03 / d);
                     }
 
-                    // Filter valid depth range (50mm to 5000mm)
                     if (pz > 50 && pz < 5000)
                     {
-                        // Calculate X and Y from pixel coordinates
                         float px = (float)((xx - cx) * pz / fx);
                         float py = (float)((yy - cy) * pz / fy);
                         validPoints.Add((px, py, pz));
@@ -785,18 +833,15 @@ namespace BoxDetect
             if (validPoints.Count < 1)
                 return false;
 
-            // Sort by Z and take median
             validPoints.Sort((a, b) => a.z.CompareTo(b.z));
             var median = validPoints[validPoints.Count / 2];
 
-            // Print disparity diagnostics every 3 seconds (but not during calibration)
             if (!IsCapturing && !QuietMode && disparities.Count > 0 && (DateTime.Now - _lastDispDiag).TotalSeconds >= 3)
             {
                 disparities.Sort();
                 float medDisp = disparities[disparities.Count / 2];
                 string mode = IsDepthCalibrated ? "empirical" : "theoretical";
 
-                // Show pixel coords and calculation for debugging
                 int centerPixelX = box.X + box.Width / 2;
                 int centerPixelY = box.Y + box.Height / 2;
                 double expectedX = (centerPixelX - cx) * median.z / fx;
@@ -813,7 +858,6 @@ namespace BoxDetect
             return true;
         }
 
-        // Get 3D coordinates for a single point (for hand-eye calibration)
         public (bool success, float x, float y, float z) GetPointDepth(Mat frame1, Mat frame2, float pixelX, float pixelY)
         {
             if (!IsCalibrated || K1 == null || P1 == null || P2 == null || Q == null)
@@ -826,13 +870,11 @@ namespace BoxDetect
             using var dispFloat = new Mat();
             disp.ConvertTo(dispFloat, MatType.CV_32F, 1.0 / 16.0);
 
-            // Q matrix for reprojection
             double cx = -Q.At<double>(0, 3);
             double cy = -Q.At<double>(1, 3);
             double f = Q.At<double>(2, 3);
             double p2_03 = P2.At<double>(0, 3);
 
-            // Sample a small area around the point and take median
             int radius = 5;
             List<float> disparities = new();
 
@@ -859,28 +901,22 @@ namespace BoxDetect
             disparities.Sort();
             float medDisp = disparities[disparities.Count / 2];
 
-            // Calculate Z using theoretical formula (scale will be corrected by Umeyama)
             float z = (float)(-p2_03 / medDisp);
 
             if (z <= 0 || z > 5000)
                 return (false, 0, 0, 0);
 
-            // Calculate X and Y (negate Y so Y+ is up, not down)
             float x = (float)((pixelX - cx) * z / f);
-            float y = (float)-((pixelY - cy) * z / f);  // Negated: Y+ = up
+            float y = (float)-((pixelY - cy) * z / f);
 
             return (true, x, y, z);
         }
 
-        // Triangulate 3D point from pixel coordinates in both cameras
-        // This is more accurate than disparity-based depth for matched detections
         public (bool success, float x, float y, float z) TriangulatePoint(float pixel1X, float pixel1Y, float pixel2X, float pixel2Y)
         {
             if (!IsCalibrated || P1 == null || P2 == null)
                 return (false, 0, 0, 0);
 
-            // Points must be in rectified image coordinates
-            // Create 2xN matrices for triangulatePoints (use float, same as P matrices)
             using var pts1 = new Mat(2, 1, MatType.CV_32F);
             using var pts2 = new Mat(2, 1, MatType.CV_32F);
 
@@ -889,7 +925,6 @@ namespace BoxDetect
             pts2.Set(0, 0, pixel2X);
             pts2.Set(1, 0, pixel2Y);
 
-            // Convert P matrices to float if needed
             using var P1f = new Mat();
             using var P2f = new Mat();
             P1.ConvertTo(P1f, MatType.CV_32F);
@@ -898,7 +933,6 @@ namespace BoxDetect
             using var point4D = new Mat();
             Cv2.TriangulatePoints(P1f, P2f, pts1, pts2, point4D);
 
-            // point4D is 4x1 CV_32F
             float w = point4D.At<float>(3, 0);
             if (Math.Abs(w) < 1e-6f)
                 return (false, 0, 0, 0);
@@ -907,18 +941,14 @@ namespace BoxDetect
             float y = point4D.At<float>(1, 0) / w;
             float z = point4D.At<float>(2, 0) / w;
 
-            // Validate - Z should be positive (in front of camera)
             if (z <= 0 || z > 10000)
                 return (false, 0, 0, 0);
 
-            // Negate Y so Y+ is up (consistent with disparity method)
             y = -y;
 
             return (true, x, y, z);
         }
 
-        // Compute 3D from pixel coordinates and known disparity value
-        // This is simpler and more accurate when disparity is from matched feature points
         public (bool success, float x, float y, float z) ComputeDepthFromDisparity(float pixelX, float pixelY, float disparity)
         {
             if (!IsCalibrated || Q == null || P2 == null)
@@ -927,26 +957,22 @@ namespace BoxDetect
             if (disparity <= 0)
                 return (false, 0, 0, 0);
 
-            // Extract calibration values from Q and P2
             double cx = -Q.At<double>(0, 3);
             double cy = -Q.At<double>(1, 3);
             double f = Q.At<double>(2, 3);
-            double p2_03 = P2.At<double>(0, 3);  // -baseline * focal (sign varies by camera order)
+            double p2_03 = P2.At<double>(0, 3);
 
-            // Z = |P2[0,3]| / disparity (use absolute value for camera order independence)
             float z = (float)(Math.Abs(p2_03) / disparity);
 
             if (z <= 0 || z > 5000)
                 return (false, 0, 0, 0);
 
-            // X and Y from pixel coordinates
             float x = (float)((pixelX - cx) * z / f);
-            float y = (float)-((pixelY - cy) * z / f);  // Negated: Y+ = up
+            float y = (float)-((pixelY - cy) * z / f);
 
             return (true, x, y, z);
         }
 
-        // Rectify a raw image point to rectified coordinates
         public (float rx, float ry) RectifyPoint(float rawX, float rawY, bool isLeftCamera)
         {
             if (!IsCalibrated)
@@ -960,10 +986,6 @@ namespace BoxDetect
 
             int px = Math.Clamp((int)rawX, 0, mapX.Width - 1);
             int py = Math.Clamp((int)rawY, 0, mapX.Height - 1);
-
-            // The rectify maps give the SOURCE pixel for each DESTINATION pixel
-            // We need the inverse - where does this raw pixel end up in rectified image?
-            // For simplicity, we can apply undistortion + rectification directly to the point
 
             var K = isLeftCamera ? K1 : K2;
             var D = isLeftCamera ? D1 : D2;
@@ -1017,12 +1039,10 @@ namespace BoxDetect
 
                 if (K1 != null && K2 != null && R != null && T != null && imageSize.Width > 0)
                 {
-                    // Recompute rectification with current alpha setting (instead of loading old maps)
                     R1 = new Mat(); R2 = new Mat();
                     P1 = new Mat(); P2 = new Mat();
                     Q = new Mat();
 
-                    // alpha=-1 lets OpenCV choose optimal value
                     Cv2.StereoRectify(K1, D1!, K2, D2!, imageSize, R, T,
                         R1, R2, P1, P2, Q,
                         StereoRectificationFlags.ZeroDisparity, -1, imageSize);
@@ -1039,8 +1059,6 @@ namespace BoxDetect
             }
             catch (Exception ex) { Console.WriteLine($"Load failed: {ex.Message}"); IsCalibrated = false; }
         }
-
-        // ===== DEPTH CALIBRATION =====
 
         public void StartDepthCalibration()
         {
@@ -1076,7 +1094,6 @@ namespace BoxDetect
         {
             if (!IsDepthCalibrating || !IsCalibrated) return false;
 
-            // Detect chessboard
             var boardSize = new Size(cornersX, cornersY);
             using var gray1 = new Mat();
             Cv2.CvtColor(frame1, gray1, ColorConversionCodes.BGR2GRAY);
@@ -1093,18 +1110,15 @@ namespace BoxDetect
             Cv2.CornerSubPix(gray1, corners, new Size(11, 11), new Size(-1, -1),
                 new TermCriteria(CriteriaTypes.Eps | CriteriaTypes.MaxIter, 30, 0.001));
 
-            // Compute disparity for this frame
             using var disp = ComputeDisparity(frame1, frame2);
             if (disp == null || disp.Empty()) return false;
 
             using var dispFloat = new Mat();
             disp.ConvertTo(dispFloat, MatType.CV_32F, 1.0 / 16.0);
 
-            // Find board center (average of all corners)
             float centerX = corners.Average(c => c.X);
             float centerY = corners.Average(c => c.Y);
 
-            // Sample disparity at ALL chessboard corners (more robust)
             List<float> disparities = new();
             foreach (var corner in corners)
             {
@@ -1126,14 +1140,12 @@ namespace BoxDetect
             disparities.Sort();
             double medianDisparity = disparities[disparities.Count / 2];
 
-            // Calculate camera 3D coords using theoretical formula (will be calibrated)
             double fx = P1!.At<double>(0, 0);
             double fy = P1.At<double>(1, 1);
             double cx = K1!.At<double>(0, 2);
             double cy = K1.At<double>(1, 2);
             double p2_03 = P2!.At<double>(0, 3);
 
-            // Theoretical Z (will be corrected by depth calibration)
             double camZ = -p2_03 / medianDisparity;
             double camX = (centerX - cx) * camZ / fx;
             double camY = (centerY - cy) * camZ / fy;
@@ -1142,13 +1154,11 @@ namespace BoxDetect
             Console.WriteLine($"  Pixel: ({centerX:F0}, {centerY:F0}), Disparity: {medianDisparity:F1}px");
             Console.WriteLine($"  Camera XYZ: ({camX:F0}, {camY:F0}, {camZ:F0}) mm (theoretical)");
 
-            // Ask user for ACTUAL MEASURED DISTANCE (for depth calibration)
             Console.Write("Measured distance from CAMERA to board (mm): ");
             if (!double.TryParse(Console.ReadLine(), out double measuredDistance)) { Console.WriteLine("Invalid, discarded"); return false; }
 
             if (measuredDistance <= 0) { Console.WriteLine("Distance must be positive"); return false; }
 
-            // Store depth sample (disparity -> measured distance)
             depthSamples.Add((medianDisparity, measuredDistance));
 
             Console.WriteLine($"\nSample {depthSamples.Count}: disparity {medianDisparity:F1}px -> {measuredDistance:F0}mm");
@@ -1165,9 +1175,6 @@ namespace BoxDetect
 
             int n = depthSamples.Count;
 
-            // ===== DEPTH CALIBRATION =====
-            // Fit hyperbolic model: Z = Scale / (disparity + Offset)
-            // Linear regression on: 1/Z = m*disparity + c
             double sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
 
             foreach (var (d, z) in depthSamples)
@@ -1190,7 +1197,6 @@ namespace BoxDetect
             Console.WriteLine($"Formula: Z = {DepthScale:F1} / (disparity + {DepthOffset:F2})");
             IsDepthCalibrated = true;
 
-            // Show calibration accuracy
             Console.WriteLine("\nCalibration check:");
             double totalError = 0;
             foreach (var (d, z) in depthSamples)
@@ -1210,7 +1216,6 @@ namespace BoxDetect
             return true;
         }
 
-        // Transform camera coords to robot coords using calibrated transform
         public (double rx, double ry, double rz) TransformCameraToRobot(double cx, double cy, double cz)
         {
             if (!HasRobotTransform) return (cx, cy, cz);
@@ -1230,7 +1235,6 @@ namespace BoxDetect
                 fs.Write("DepthScale", DepthScale);
                 fs.Write("DepthOffset", DepthOffset);
 
-                // Save robot transform
                 fs.Write("HasRobotTransform", HasRobotTransform ? 1 : 0);
                 if (HasRobotTransform)
                 {
@@ -1256,7 +1260,6 @@ namespace BoxDetect
             {
                 using var fs = new FileStorage(DepthCalibFile, FileStorage.Modes.Read);
 
-                // Load depth calibration
                 try
                 {
                     DepthScale = fs["DepthScale"]?.ReadFloat() ?? 0;
@@ -1270,8 +1273,6 @@ namespace BoxDetect
                 }
                 catch { Console.WriteLine("  (depth params missing or invalid)"); }
 
-                // Robot transform from Kabsch is disabled - use legacy (R key) instead
-                // Old HasRobotTransform data in file is ignored
                 HasRobotTransform = false;
             }
             catch (Exception ex)
@@ -1281,7 +1282,6 @@ namespace BoxDetect
             }
         }
 
-        // Apply empirical depth correction
         public double ApplyDepthCalibration(double disparity)
         {
             if (!IsDepthCalibrated || disparity <= 0) return 0;
@@ -1303,7 +1303,6 @@ namespace BoxDetect
             Console.WriteLine($"Modbus server on port {port}");
         }
 
-        // Check if robot has triggered (Register 8)
         public bool IsTriggerSet()
         {
             if (_server == null) return false;
@@ -1313,7 +1312,6 @@ namespace BoxDetect
             }
         }
 
-        // Clear the trigger after processing
         public void ClearTrigger()
         {
             if (_server == null) return;
@@ -1329,19 +1327,10 @@ namespace BoxDetect
 
             lock (_lock)
             {
-                // Register 0: X × 10 (scaled)
                 _server.holdingRegisters[1] = (short)(x * 10);
-
-                // Register 2: Y × 10 (scaled)
                 _server.holdingRegisters[3] = (short)(y * 10);
-
-                // Register 3: TeaType (1=green, 2=red)
                 _server.holdingRegisters[4] = (short)teaType;
-
-                // Register 4: Z × 10 (scaled)
                 _server.holdingRegisters[5] = (short)(z * 10);
-
-                // Register 6: Done flag (1 = coordinates ready)
                 _server.holdingRegisters[7] = (short)(x != 0 || y != 0 ? 1 : 0);
             }
         }
@@ -1350,13 +1339,10 @@ namespace BoxDetect
     }
 
 
-    // Hand-eye calibration using point correspondences
-    // Computes: robot = scale * R * camera + T (Umeyama algorithm)
     class RobotCalibration
     {
         private const string CalibFile = "robot_calib.xml";
 
-        // Umeyama transform parameters
         public double Scale { get; private set; } = 1.0;
         public double[] RotationMatrix { get; private set; } = new double[9] { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
         public double TranslationX { get; private set; } = 0;
@@ -1366,10 +1352,8 @@ namespace BoxDetect
         public bool IsCalibrated { get; private set; }
         public bool IsCalibrating { get; private set; }
 
-        // Point correspondences: (camera XYZ, robot XYZ)
         private List<(double cx, double cy, double cz, double rx, double ry, double rz)> points = new();
 
-        // Pending camera point waiting for robot input
         private (double cx, double cy, double cz)? pendingCameraPoint = null;
 
         public RobotCalibration()
@@ -1449,7 +1433,6 @@ namespace BoxDetect
         {
             if (!IsCalibrating || !stereo.IsCalibrated) return false;
 
-            // If we have a pending point, ask for robot coords
             if (pendingCameraPoint.HasValue)
             {
                 var cam = pendingCameraPoint.Value;
@@ -1476,20 +1459,17 @@ namespace BoxDetect
                 return true;
             }
 
-            // Use YOLO detection instead of chessboard
             if (detections == null || detections.Count == 0)
             {
                 Console.WriteLine("No object detected - place can in view");
                 return false;
             }
 
-            var det = detections[0];  // Use first detected object
+            var det = detections[0];
 
-            // Get bounding box center
             float centerX = det.BoundingBox.X + det.BoundingBox.Width / 2f;
             float centerY = det.BoundingBox.Y + det.BoundingBox.Height / 2f;
 
-            // Get depth at center using stereo
             var (hasDepth, camX, camY, camZ) = stereo.GetPointDepth(frame1, frame2, centerX, centerY);
 
             if (!hasDepth || camZ <= 0)
@@ -1498,12 +1478,10 @@ namespace BoxDetect
                 return false;
             }
 
-            // Adjust Y to get TOP of object (camera Y+ is down)
-            // half_height_mm = (bbox_height_pixels / 2) * Z / focal_length
             double f = stereo.GetFocalLength();
             double halfHeightPx = det.BoundingBox.Height / 2.0;
             double halfHeightMm = halfHeightPx * camZ / f;
-            double topY = camY + halfHeightMm;  // Add because Y+ is up, top is higher Y
+            double topY = camY + halfHeightMm;
 
             pendingCameraPoint = (camX, topY, camZ);
             Console.WriteLine($"\n{det.Label} detected:");
@@ -1514,12 +1492,10 @@ namespace BoxDetect
             return true;
         }
 
-        // Color-based capture using triangulation (more accurate than YOLO bbox + disparity)
         public bool CapturePointWithColor(Mat frame1, Mat frame2, StereoDepth stereo, ColorDetector colorDetector)
         {
             if (!IsCalibrating || !stereo.IsCalibrated) return false;
 
-            // If we have a pending point, ask for robot coords
             if (pendingCameraPoint.HasValue)
             {
                 var cam = pendingCameraPoint.Value;
@@ -1546,7 +1522,6 @@ namespace BoxDetect
                 return true;
             }
 
-            // Detect in RAW frames
             var (found1, raw1X, raw1Y, mask1) = colorDetector.DetectGreen(frame1);
             var (found2, raw2X, raw2Y, mask2) = colorDetector.DetectGreen(frame2);
 
@@ -1559,18 +1534,15 @@ namespace BoxDetect
                 return false;
             }
 
-            // Rectify the centroid points
             var (rect1X, rect1Y) = stereo.RectifyPoint(raw1X, raw1Y, true);
             var (rect2X, rect2Y) = stereo.RectifyPoint(raw2X, raw2Y, false);
 
-            // Check Y difference (should be small for good rectification)
             float yDiff = Math.Abs(rect1Y - rect2Y);
             if (yDiff > 30)
             {
                 Console.WriteLine($"Warning: Y difference = {yDiff:F1}px (should be < 30 for good match)");
             }
 
-            // Compute depth from disparity
             float disparity = Math.Abs(rect1X - rect2X);
             var (success, x, y, z) = stereo.ComputeDepthFromDisparity(rect1X, rect1Y, disparity);
 
@@ -1600,12 +1572,8 @@ namespace BoxDetect
 
             Console.WriteLine($"\nComputing transform from {points.Count} points...");
 
-            // Umeyama algorithm: finds scale, rotation, translation
-            // that minimizes: sum || robot - (scale * R * camera + T) ||^2
-
             int n = points.Count;
 
-            // Compute centroids
             double camCentX = points.Average(p => p.cx);
             double camCentY = points.Average(p => p.cy);
             double camCentZ = points.Average(p => p.cz);
@@ -1613,7 +1581,6 @@ namespace BoxDetect
             double robCentY = points.Average(p => p.ry);
             double robCentZ = points.Average(p => p.rz);
 
-            // Compute variance of camera points (for scale)
             double camVar = 0;
             foreach (var p in points)
             {
@@ -1621,7 +1588,6 @@ namespace BoxDetect
             }
             camVar /= n;
 
-            // Build cross-covariance matrix H = sum of (robot_centered * camera_centered^T)
             double[,] H = new double[3, 3];
             foreach (var p in points)
             {
@@ -1632,13 +1598,11 @@ namespace BoxDetect
                 double ry = p.ry - robCentY;
                 double rz = p.rz - robCentZ;
 
-                // H = robot * camera^T (outer product)
                 H[0, 0] += rx * cx; H[0, 1] += rx * cy; H[0, 2] += rx * cz;
                 H[1, 0] += ry * cx; H[1, 1] += ry * cy; H[1, 2] += ry * cz;
                 H[2, 0] += rz * cx; H[2, 1] += rz * cy; H[2, 2] += rz * cz;
             }
 
-            // SVD of H
             using var HMat = new Mat(3, 3, MatType.CV_64FC1);
             for (int i = 0; i < 3; i++)
                 for (int j = 0; j < 3; j++)
@@ -1649,37 +1613,30 @@ namespace BoxDetect
             using var Vt = new Mat();
             Cv2.SVDecomp(HMat, W, U, Vt);
 
-            // R = U * V^T (Vt is already V transposed from SVDecomp)
             using var R_mat = new Mat();
             using var emptyMat = new Mat();
             Cv2.Gemm(U, Vt, 1, emptyMat, 0, R_mat);
 
-            // Check for reflection (det(R) should be +1)
             double det = Cv2.Determinant(R_mat);
             if (det < 0)
             {
-                // Flip sign of last column of U
                 for (int i = 0; i < 3; i++)
                     U.Set(i, 2, -U.At<double>(i, 2));
                 Cv2.Gemm(U, Vt, 1, emptyMat, 0, R_mat);
             }
 
-            // Store rotation matrix
             for (int i = 0; i < 3; i++)
                 for (int j = 0; j < 3; j++)
                     RotationMatrix[i * 3 + j] = R_mat.At<double>(i, j);
 
-            // Compute scale: scale = trace(D * S) / variance
-            // Note: W contains singular values, camVar is already divided by n
             double traceRH = 0;
             for (int i = 0; i < 3; i++)
             {
                 double sign = (i == 2 && det < 0) ? -1 : 1;
                 traceRH += sign * W.At<double>(i, 0);
             }
-            Scale = traceRH / (n * camVar);  // camVar = sum/n, so n*camVar = sum
+            Scale = traceRH / (n * camVar);
 
-            // Compute translation: T = robot_centroid - scale * R * camera_centroid
             double rcx = Scale * (RotationMatrix[0] * camCentX + RotationMatrix[1] * camCentY + RotationMatrix[2] * camCentZ);
             double rcy = Scale * (RotationMatrix[3] * camCentX + RotationMatrix[4] * camCentY + RotationMatrix[5] * camCentZ);
             double rcz = Scale * (RotationMatrix[6] * camCentX + RotationMatrix[7] * camCentY + RotationMatrix[8] * camCentZ);
@@ -1688,7 +1645,6 @@ namespace BoxDetect
             TranslationY = robCentY - rcy;
             TranslationZ = robCentZ - rcz;
 
-            // Print results
             Console.WriteLine("\n===== HAND-EYE CALIBRATION COMPLETE =====");
             Console.WriteLine($"Scale: {Scale:F4}");
             Console.WriteLine($"Translation: ({TranslationX:F1}, {TranslationY:F1}, {TranslationZ:F1}) mm");
@@ -1697,7 +1653,6 @@ namespace BoxDetect
             Console.WriteLine($"  [{RotationMatrix[3]:F4} {RotationMatrix[4]:F4} {RotationMatrix[5]:F4}]");
             Console.WriteLine($"  [{RotationMatrix[6]:F4} {RotationMatrix[7]:F4} {RotationMatrix[8]:F4}]");
 
-            // Calculate and show errors
             Console.WriteLine("\nCalibration errors:");
             double totalError = 0;
             for (int i = 0; i < points.Count; i++)
@@ -1723,7 +1678,6 @@ namespace BoxDetect
         {
             if (!IsCalibrated) return (cx, cy, cz);
 
-            // Apply: robot = scale * R * camera + T
             double rx = Scale * (RotationMatrix[0] * cx + RotationMatrix[1] * cy + RotationMatrix[2] * cz) + TranslationX;
             double ry = Scale * (RotationMatrix[3] * cx + RotationMatrix[4] * cy + RotationMatrix[5] * cz) + TranslationY;
             double rz = Scale * (RotationMatrix[6] * cx + RotationMatrix[7] * cy + RotationMatrix[8] * cz) + TranslationZ;
@@ -1789,7 +1743,41 @@ namespace BoxDetect
         static DateTime lastRobotPrint = DateTime.MinValue;
         static DateTime _lastTriangDebug = DateTime.MinValue;
 
-        // Helper to expand a rectangle by a margin, clamped to image bounds
+        // === EDGE MASKING ===
+        // Percentage of frame to black out from EACH side (left, right, top, AND bottom).
+        // 0.0 = no masking. 0.20 = block out 20% from every edge (a smaller centered
+        // region remains visible - roughly 60% width x 60% height in the middle).
+        // Adjust this value to tune how much of the edges gets ignored by color detection.
+        static double EdgeMaskPercent = 0.0;
+
+        // Blacks out the left, right, top, and bottom edges of the frame in-place.
+        // Percent is per-side: 0.20 means 20% blocked on EACH of the 4 sides (not 20% total).
+        static void ApplyEdgeMask(Mat frame, double percentPerSide)
+        {
+            if (percentPerSide <= 0) return;
+            percentPerSide = Math.Clamp(percentPerSide, 0.0, 0.49); // cap under 50% per side so some center always remains
+
+            int width = frame.Width;
+            int height = frame.Height;
+            int blockWidth = (int)(width * percentPerSide);
+            int blockHeight = (int)(height * percentPerSide);
+
+            if (blockWidth <= 0 && blockHeight <= 0) return;
+
+            // Left strip
+            if (blockWidth > 0)
+                Cv2.Rectangle(frame, new Rect(0, 0, blockWidth, height), Scalar.Black, -1);
+            // Right strip
+            if (blockWidth > 0)
+                Cv2.Rectangle(frame, new Rect(width - blockWidth, 0, blockWidth, height), Scalar.Black, -1);
+            // Top strip
+            if (blockHeight > 0)
+                Cv2.Rectangle(frame, new Rect(0, 0, width, blockHeight), Scalar.Black, -1);
+            // Bottom strip
+            if (blockHeight > 0)
+                Cv2.Rectangle(frame, new Rect(0, height - blockHeight, width, blockHeight), Scalar.Black, -1);
+        }
+
         static Rect ExpandRect(Rect r, int margin, int maxWidth, int maxHeight)
         {
             int x = Math.Max(0, r.X - margin);
@@ -1799,11 +1787,18 @@ namespace BoxDetect
             return new Rect(x, y, w, h);
         }
 
+        static string GetTeaTypeName(int teaType)
+        {
+            return teaType == 1 ? "GREEN-cat" : teaType == 2 ? "RED-cat" : "???";
+        }
+
         static void Main(string[] args)
         {
-            Console.WriteLine("=== Stereo Vision: Color Detection ===\n");
+            Console.WriteLine("=== Stereo Vision: Hierarchical Color Detection ===");
+            Console.WriteLine("Priority: white > cardboard > red > green > orange > black > purple");
+            Console.WriteLine("teaType 1 (green cat): white, green, orange");
+            Console.WriteLine("teaType 2 (red cat):   cardboard, red, black, purple\n");
 
-            // Color detector for green object detection
             var colorDetector = new ColorDetector();
 
             var stereo = new StereoDepth();
@@ -1829,30 +1824,22 @@ namespace BoxDetect
             cap2.Set(VideoCaptureProperties.FrameWidth, 640);
             cap2.Set(VideoCaptureProperties.FrameHeight, 480);
 
-            // Disable auto-focus on both cameras for consistent stereo
             cap1.Set(VideoCaptureProperties.AutoFocus, 0);
             cap2.Set(VideoCaptureProperties.AutoFocus, 0);
-            // Set fixed focus (0 = infinity, higher = closer) - adjust if needed
             cap1.Set(VideoCaptureProperties.Focus, 0);
             cap2.Set(VideoCaptureProperties.Focus, 0);
 
-            // Match brightness/exposure between cameras
-            // Bright overhead light setup - lower exposure to prevent overexposure
-            // NOTE: DSHOW uses 0.25 = manual, 0.75 = auto (NOT plain 0/1)
+            // DSHOW uses 0.25 = manual, 0.75 = auto (NOT plain 0/1)
             cap1.Set(VideoCaptureProperties.AutoExposure, 0.25);
             cap2.Set(VideoCaptureProperties.AutoExposure, 0.25);
-            // Set twice - some DSHOW drivers ignore the first call
             cap1.Set(VideoCaptureProperties.AutoExposure, 0.25);
             cap2.Set(VideoCaptureProperties.AutoExposure, 0.25);
 
-            cap1.Set(VideoCaptureProperties.Exposure, -6);  // Lower for bright light (-7 to -1)
-            cap2.Set(VideoCaptureProperties.Exposure, -6);  // Match cam1
-            cap1.Set(VideoCaptureProperties.Brightness, 100);  // 0-255
-            cap2.Set(VideoCaptureProperties.Brightness, 100);  // Match cam1
+            cap1.Set(VideoCaptureProperties.Exposure, -6);
+            cap2.Set(VideoCaptureProperties.Exposure, -6);
+            cap1.Set(VideoCaptureProperties.Brightness, 100);
+            cap2.Set(VideoCaptureProperties.Brightness, 100);
 
-            // Note: Cameras may have different zoom - stereo calibration handles this
-
-            // Print current values to verify
             Console.WriteLine($"Cam1 - Zoom:{cap1.Get(VideoCaptureProperties.Zoom)} AutoExposure:{cap1.Get(VideoCaptureProperties.AutoExposure)} Exposure:{cap1.Get(VideoCaptureProperties.Exposure)} Brightness:{cap1.Get(VideoCaptureProperties.Brightness)}");
             Console.WriteLine($"Cam2 - Zoom:{cap2.Get(VideoCaptureProperties.Zoom)} AutoExposure:{cap2.Get(VideoCaptureProperties.AutoExposure)} Exposure:{cap2.Get(VideoCaptureProperties.Exposure)} Brightness:{cap2.Get(VideoCaptureProperties.Brightness)}");
 
@@ -1863,13 +1850,11 @@ namespace BoxDetect
             var w1 = new Window("Mask 1");
             var w2 = new Window("Mask 2");
 
-            // Position windows side by side
             Cv2.MoveWindow("Mask 1", 0, 0);
             Cv2.MoveWindow("Mask 2", 660, 0);
 
             // === EXPOSURE/BRIGHTNESS SLIDERS (per camera) ===
-            // Slider range 0-14 maps to exposure -7..7 (typical UVC range for DSHOW)
-            int exp1Slider = 1;   // -7 + 1 = -6, matches default above
+            int exp1Slider = 1;   // -6
             int exp2Slider = 1;   // -6
             int bright1Slider = 100;
             int bright2Slider = 100;
@@ -1897,54 +1882,50 @@ namespace BoxDetect
                 cap1.Set(VideoCaptureProperties.Brightness, curBright1);
                 cap2.Set(VideoCaptureProperties.Brightness, curBright2);
 
-                // Grab both frames as close together as possible for better sync
                 cap1.Grab(); cap2.Grab();
                 if (!cap1.Retrieve(f1) || !cap2.Retrieve(f2)) continue;
                 if (f1.Empty() || f2.Empty()) continue;
 
-                // === COLOR DETECTION ON RAW FRAMES ===
+                // Apply configurable edge masking (0% = no effect) before any detection runs
+                ApplyEdgeMask(f1, EdgeMaskPercent);
+                ApplyEdgeMask(f2, EdgeMaskPercent);
+
+                // === HIERARCHICAL COLOR DETECTION ON RAW FRAMES ===
 
                 float finalX = 0, finalY = 0, finalZ = 0;
-                int teaType = 0;  // 0=none, 1=green, 2=red
+                int teaType = 0;
                 bool hasDetection = false;
                 float cent1X = 0, cent1Y = 0, cent2X = 0, cent2Y = 0;
                 Mat? mask1 = null, mask2 = null;
 
-                // Detect color (green or red) in both RAW frames
                 var (found1, raw1X, raw1Y, tea1, m1) = colorDetector.DetectColor(f1);
                 var (found2, raw2X, raw2Y, tea2, m2) = colorDetector.DetectColor(f2);
                 mask1 = m1;
                 mask2 = m2;
 
-                // Store RAW centroids for display immediately
                 if (found1) { cent1X = raw1X; cent1Y = raw1Y; }
                 if (found2) { cent2X = raw2X; cent2Y = raw2Y; }
 
-                // Both cameras must see the same color
-                // Both cameras must detect something (colors can differ)
+                // Both cameras must detect a color; teaType from cam1 wins.
                 if (stereo.IsCalibrated && found1 && found2)
                 {
-                    teaType = tea1;  // Use camera 1's color
+                    teaType = tea1;
 
-                    // Rectify the centroid points (not the whole frame)
                     var (rect1X, rect1Y) = stereo.RectifyPoint(raw1X, raw1Y, true);
                     var (rect2X, rect2Y) = stereo.RectifyPoint(raw2X, raw2Y, false);
 
-                    // Check Y alignment (should be similar after rectification)
                     float yDiff = Math.Abs(rect1Y - rect2Y);
                     float disparity = Math.Abs(rect1X - rect2X);
 
-                    if (yDiff < 100)  // Relaxed threshold for calibration variance
+                    if (yDiff < 100)
                     {
-                        if (disparity > 5)  // Minimum disparity threshold
+                        if (disparity > 5)
                         {
-                            // Use disparity-based depth
                             var (success, x, y, z) = stereo.ComputeDepthFromDisparity(rect1X, rect1Y, disparity);
 
                             if (success)
                             {
-                                // Add to buffer for smoothing
-                                string label = teaType == 1 ? "green" : "red";
+                                string label = "t" + teaType;
                                 if (!depthBuffer.ContainsKey(label))
                                     depthBuffer[label] = new List<(float, float, float)>();
 
@@ -1952,7 +1933,6 @@ namespace BoxDetect
                                 if (depthBuffer[label].Count > BufferSize)
                                     depthBuffer[label].RemoveAt(0);
 
-                                // Use median of buffer
                                 var buf = depthBuffer[label];
                                 var xs = buf.Select(b => b.x).OrderBy(v => v).ToList();
                                 var ys = buf.Select(b => b.y).OrderBy(v => v).ToList();
@@ -1963,18 +1943,16 @@ namespace BoxDetect
                                 finalZ = zs[zs.Count / 2];
                                 hasDetection = true;
 
-                                // Store RAW centroids for display
                                 cent1X = raw1X; cent1Y = raw1Y;
                                 cent2X = raw2X; cent2Y = raw2Y;
 
                                 lastDepth[label] = (finalX, finalY, finalZ, 0);
 
-                                // Debug output (every 3 sec)
                                 if (!stereo.QuietMode && !stereo.IsCapturing && (DateTime.Now - _lastTriangDebug).TotalSeconds >= 3)
                                 {
-                                    Console.WriteLine($"Raw: L({raw1X:F0},{raw1Y:F0}) R({raw2X:F0},{raw2Y:F0})");
+                                    Console.WriteLine($"Raw: L({raw1X:F0},{raw1Y:F0}) R({raw2X:F0},{raw2Y:F0}) [L=t{tea1}, R=t{tea2}]");
                                     Console.WriteLine($"Rect: L({rect1X:F0},{rect1Y:F0}) R({rect2X:F0},{rect2Y:F0}) disp={disparity:F1} yDiff={yDiff:F1}");
-                                    Console.WriteLine($"3D: ({x:F0}, {y:F0}, {z:F0})mm [{label}]");
+                                    Console.WriteLine($"3D: ({x:F0}, {y:F0}, {z:F0})mm [teaType={teaType}]");
                                     _lastTriangDebug = DateTime.Now;
                                 }
                             }
@@ -1985,48 +1963,38 @@ namespace BoxDetect
                 // Fall back to last known position if no current detection
                 if (!hasDetection)
                 {
-                    // Check both colors for last known position
-                    if (lastDepth.TryGetValue("green", out var lastGreen) && lastGreen.age < MaxAge)
+                    if (lastDepth.TryGetValue("t1", out var last1) && last1.age < MaxAge)
                     {
-                        finalX = lastGreen.x; finalY = lastGreen.y; finalZ = lastGreen.z;
+                        finalX = last1.x; finalY = last1.y; finalZ = last1.z;
                         teaType = 1;
                         hasDetection = true;
-                        lastDepth["green"] = (lastGreen.x, lastGreen.y, lastGreen.z, lastGreen.age + 1);
+                        lastDepth["t1"] = (last1.x, last1.y, last1.z, last1.age + 1);
                     }
-                    else if (lastDepth.TryGetValue("red", out var lastRed) && lastRed.age < MaxAge)
+                    else if (lastDepth.TryGetValue("t2", out var last2) && last2.age < MaxAge)
                     {
-                        finalX = lastRed.x; finalY = lastRed.y; finalZ = lastRed.z;
+                        finalX = last2.x; finalY = last2.y; finalZ = last2.z;
                         teaType = 2;
                         hasDetection = true;
-                        lastDepth["red"] = (lastRed.x, lastRed.y, lastRed.z, lastRed.age + 1);
+                        lastDepth["t2"] = (last2.x, last2.y, last2.z, last2.age + 1);
                     }
                 }
 
-                // Compute disparity only for display (if enabled)
                 Mat? disp = null;
                 if (showDisp && stereo.IsCalibrated)
                 {
                     disp = stereo.ComputeDisparity(f1, f2);
                 }
 
-                // Update Modbus and console with robot coordinates
                 if (hasDetection)
                 {
-                    // Cameras mounted above - seeing top of box directly
-                    // No offsets needed - centroid IS the pick point
-
-                    // Transform camera coords to robot coords
                     var (rx, ry, rz) = robotCalib.TransformToRobot(finalX, finalY, finalZ);
-
-                    // Send robot coords + teaType to Modbus
                     modbus.UpdateCoordinates(rx, ry, rz, teaType);
 
-                    // Print to console periodically (every 3 seconds) - but not during calibration
-                    string colorName = teaType == 1 ? "GREEN" : teaType == 2 ? "RED" : "???";
+                    string colorName = GetTeaTypeName(teaType);
                     if (!stereo.QuietMode && !stereo.IsCapturing && !robotCalib.IsCalibrating &&
                         robotCalib.IsCalibrated && (DateTime.Now - lastRobotPrint).TotalSeconds >= 3)
                     {
-                        Console.WriteLine($"{colorName} box: Camera({finalX:F0}, {finalY:F0}, {finalZ:F0}) → Robot({rx:F0}, {ry:F0}, {rz:F0})");
+                        Console.WriteLine($"{colorName} (teaType={teaType}): Camera({finalX:F0}, {finalY:F0}, {finalZ:F0}) → Robot({rx:F0}, {ry:F0}, {rz:F0})");
                         lastRobotPrint = DateTime.Now;
                     }
                 }
@@ -2049,7 +2017,6 @@ namespace BoxDetect
                 if (showDisp && disp != null && !disp.Empty())
                 {
                     using var vis = new Mat();
-                    // numDisparities=256, raw values scaled by 16
                     disp.ConvertTo(vis, MatType.CV_8U, 255.0 / (256 * 16));
                     Cv2.ApplyColorMap(vis, vis, ColormapTypes.Jet);
                     dw ??= new Window("Disparity");
@@ -2057,10 +2024,8 @@ namespace BoxDetect
                 }
                 disp?.Dispose();
 
-                // Show masks with centroids drawn (unless stereo calibrating - then show raw)
                 if (stereo.IsCapturing)
                 {
-                    // During stereo calibration, show raw frames so user can see chessboard
                     w1.ShowImage(f1);
                     w2.ShowImage(f2);
                     mask1?.Dispose();
@@ -2068,19 +2033,17 @@ namespace BoxDetect
                 }
                 else
                 {
-                    // Normal mode - show masks
                     if (mask1 != null && !mask1.Empty())
                     {
                         using var mask1Color = new Mat();
                         Cv2.CvtColor(mask1, mask1Color, ColorConversionCodes.GRAY2BGR);
 
-                        // Draw centroid on mask
                         if (found1)
                             Cv2.Circle(mask1Color, new Point((int)cent1X, (int)cent1Y), 8, new Scalar(0, 0, 255), -1);
 
-                        // Draw status text with color type
-                        string colorLabel = teaType == 1 ? "GREEN" : teaType == 2 ? "RED" : "";
-                        string status = hasDetection ? $"Detected {colorLabel}" : (found1 && found2 ? "Color mismatch" : "Searching...");
+                        string colorLabel = GetTeaTypeName(teaType);
+                        string status = hasDetection ? $"Detected teaType={teaType} ({colorLabel})"
+                                                     : (found1 && found2 ? "Depth failed" : "Searching...");
                         Cv2.PutText(mask1Color, status, new Point(10, 30), HersheyFonts.HersheySimplex, 0.7,
                             hasDetection ? new Scalar(0, 255, 0) : new Scalar(0, 0, 255), 2);
 
@@ -2103,7 +2066,6 @@ namespace BoxDetect
                         using var mask2Color = new Mat();
                         Cv2.CvtColor(mask2, mask2Color, ColorConversionCodes.GRAY2BGR);
 
-                        // Draw centroid on mask
                         if (found2)
                             Cv2.Circle(mask2Color, new Point((int)cent2X, (int)cent2Y), 8, new Scalar(0, 0, 255), -1);
 
@@ -2120,7 +2082,7 @@ namespace BoxDetect
                 if (k == 'q' || k == 'Q' || k == 27) break;
                 if (k == 't' || k == 'T') stereo.StartCalibration();
                 if (k == 'r') { robotCalib.StartCalibration(stereo); stereo.QuietMode = true; }
-                if (k == 'R') { robotCalib.ManualCalibration(); stereo.QuietMode = false; }  // Shift+R = manual entry
+                if (k == 'R') { robotCalib.ManualCalibration(); stereo.QuietMode = false; }
                 if (k == ' ')
                 {
                     if (stereo.IsCapturing)
