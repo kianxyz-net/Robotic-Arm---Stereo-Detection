@@ -161,25 +161,53 @@ namespace BoxDetect
     // Hierarchical multi-color detector with per-color size thresholds
     // ---------------------------------------------------------------------------
     // Priority order (first match wins):
-    //   1. WHITE      -> teaType 1 (green category)
-    //   2. CARDBOARD  -> teaType 2 (red category)
-    //   3. RED        -> teaType 2 (red category)
-    //   4. GREEN      -> teaType 1 (green category)
-    //   5. ORANGE     -> teaType 1 (green category)
-    //   6. BLACK      -> teaType 2 (red category)
-    //   7. PURPLE     -> teaType 2 (red category)
+    //   1. GREEN      -> teaType 1 (green category)
+    //   2. RED        -> teaType 2 (red category)
+    //   3. ORANGE     -> teaType 1 (green category)
+    //   4. CARDBOARD  -> teaType 2 (red category)
+    //   5. WHITE      -> teaType 1 (green category)
     //
-    // Per-color MinArea: background-prone colors (white/black/cardboard) require
-    // MUCH larger blobs to trigger. Target colors keep tight thresholds so they
-    // still fire reliably on actual small/medium boxes.
+    // Known collision risks:
+    //   - RED vs ORANGE: European Coke (red) and Fanta (orange) sit close in hue.
+    //     Red runs BEFORE orange, so ambiguous items default to red.
+    //   - CARDBOARD vs WHITE: both are desaturated/neutral, differ mainly by V.
+    //     Cardboard runs BEFORE white, so ambiguous items default to cardboard.
     //
     // HSV ranges tuned for well-lit indoor/office lighting.
     // OpenCV HSV: H 0-179, S 0-255, V 0-255
     // ===========================================================================
     public class ColorDetector
     {
-        // Real target boxes: red/green/orange are ~10-20k px, white/cardboard/black/purple are 1/4-1/2 of that (~2.5-10k px).
+        // Real target boxes: red/green/orange are ~10-20k px, white/cardboard are 1/4-1/2 of that (~2.5-10k px).
         // So MinArea can't be too high on the smaller-box colors -- must rely on TIGHT HSV instead.
+
+        // ---- GREEN ----
+        private readonly Scalar _lowerGreen = new Scalar(35, 60, 40);
+        private readonly Scalar _upperGreen = new Scalar(90, 255, 255);
+        private const int MinAreaGreen = 1500;
+
+        // ---- RED ----
+        // Two ranges (hue wraps around 0/180). High S floor rejects pinks.
+        // Tight upper bound (H<=8) leaves a small dead zone before orange starts at H=12.
+        private readonly Scalar _lowerRed1 = new Scalar(0, 150, 60);
+        private readonly Scalar _upperRed1 = new Scalar(8, 255, 255);
+        private readonly Scalar _lowerRed2 = new Scalar(172, 150, 60);
+        private readonly Scalar _upperRed2 = new Scalar(180, 255, 255);
+        private const int MinAreaRed = 1500;
+
+        // ---- ORANGE ----
+        // Starts at H=12, leaving a dead zone (H 9-11) between red and orange.
+        // High S floor keeps it well separated from cardboard.
+        private readonly Scalar _lowerOrange = new Scalar(12, 150, 100);
+        private readonly Scalar _upperOrange = new Scalar(22, 255, 255);
+        private const int MinAreaOrange = 1500;
+
+        // ---- CARDBOARD (light brown/tan) ----
+        // S range 60-120: floor rejects gray/beige backgrounds, ceiling keeps a
+        // gap from orange (which starts at S=150).
+        private readonly Scalar _lowerCardboard = new Scalar(8, 60, 80);
+        private readonly Scalar _upperCardboard = new Scalar(22, 120, 190);
+        private const int MinAreaCardboard = 2000;  // Low enough for smaller cardboard boxes
 
         // ---- WHITE ----
         // Very strict HSV: V>=230 (only truly bright), S<=25 (only truly neutral).
@@ -188,52 +216,13 @@ namespace BoxDetect
         private readonly Scalar _upperWhite = new Scalar(179, 25, 255);
         private const int MinAreaWhite = 2500;   // Low enough for smaller white boxes
 
-        // ---- CARDBOARD (light brown/tan) ----
-        // S range 60-120 (was 40-150). Cutting the low-S end rejects gray/beige backgrounds,
-        // cutting the high-S end keeps a big gap from orange (which starts at 150).
-        private readonly Scalar _lowerCardboard = new Scalar(8, 60, 80);
-        private readonly Scalar _upperCardboard = new Scalar(22, 120, 190);
-        private const int MinAreaCardboard = 2000;  // Low enough for smaller cardboard boxes
-
-        // ---- RED ----
-        // Two ranges (hue wraps around 0/180). High S floor rejects pinks.
-        private readonly Scalar _lowerRed1 = new Scalar(0, 150, 60);
-        private readonly Scalar _upperRed1 = new Scalar(10, 255, 255);
-        private readonly Scalar _lowerRed2 = new Scalar(170, 150, 60);
-        private readonly Scalar _upperRed2 = new Scalar(180, 255, 255);
-        private const int MinAreaRed = 1500;
-
-        // ---- GREEN ----
-        private readonly Scalar _lowerGreen = new Scalar(35, 60, 40);
-        private readonly Scalar _upperGreen = new Scalar(90, 255, 255);
-        private const int MinAreaGreen = 1500;
-
-        // ---- ORANGE ----
-        // Requires S>=150 (cardboard tops out at 120, so 30-unit safety gap).
-        private readonly Scalar _lowerOrange = new Scalar(10, 150, 100);
-        private readonly Scalar _upperOrange = new Scalar(22, 255, 255);
-        private const int MinAreaOrange = 1500;
-
-        // ---- BLACK ----
-        // Very strict V<=30 (was 40, then 50). Real black boxes still hit this;
-        // shadows/dark surfaces usually sit at V 30-60.
-        private readonly Scalar _lowerBlack = new Scalar(0, 0, 0);
-        private readonly Scalar _upperBlack = new Scalar(179, 255, 30);
-        private const int MinAreaBlack = 2000;   // Low enough for smaller black boxes
-
-        // ---- PURPLE ----
-        private readonly Scalar _lowerPurple = new Scalar(125, 60, 40);
-        private readonly Scalar _upperPurple = new Scalar(155, 255, 255);
-        private const int MinAreaPurple = 1500;
-
         // Legacy field kept for backward compatibility - no longer used internally
         public int MinArea { get; set; } = 1500;
 
         /// <summary>
         /// Detect the highest-priority color present in the frame.
-        /// Each color uses its own MinArea threshold - background-prone colors
-        /// (white/black/cardboard) require much bigger blobs than target colors.
-        /// Returns teaType: 0=none, 1=green cat (white/green/orange), 2=red cat (cardboard/red/black/purple)
+        /// Priority: Green > Red > Orange > Cardboard > White.
+        /// Returns teaType: 0=none, 1=green cat (green/orange/white), 2=red cat (red/cardboard)
         /// </summary>
         public (bool found, float cx, float cy, int teaType, Mat mask) DetectColor(Mat frame)
         {
@@ -243,39 +232,29 @@ namespace BoxDetect
             using var hsv = new Mat();
             Cv2.CvtColor(blurred, hsv, ColorConversionCodes.BGR2HSV);
 
-            // 1. WHITE -> teaType 1
-            var result = TryDetect(hsv, _lowerWhite, _upperWhite, MinAreaWhite);
+            // 1. GREEN -> teaType 1
+            var result = TryDetect(hsv, _lowerGreen, _upperGreen, MinAreaGreen);
             if (result.found) return (true, result.cx, result.cy, 1, result.mask);
             result.mask.Dispose();
 
-            // 2. CARDBOARD -> teaType 2
-            result = TryDetect(hsv, _lowerCardboard, _upperCardboard, MinAreaCardboard);
-            if (result.found) return (true, result.cx, result.cy, 2, result.mask);
-            result.mask.Dispose();
-
-            // 3. RED (dual range) -> teaType 2
+            // 2. RED (dual range) -> teaType 2
             var redResult = TryDetectDualRange(hsv, _lowerRed1, _upperRed1, _lowerRed2, _upperRed2, MinAreaRed);
             if (redResult.found) return (true, redResult.cx, redResult.cy, 2, redResult.mask);
             redResult.mask.Dispose();
 
-            // 4. GREEN -> teaType 1
-            result = TryDetect(hsv, _lowerGreen, _upperGreen, MinAreaGreen);
-            if (result.found) return (true, result.cx, result.cy, 1, result.mask);
-            result.mask.Dispose();
-
-            // 5. ORANGE -> teaType 1
+            // 3. ORANGE -> teaType 1
             result = TryDetect(hsv, _lowerOrange, _upperOrange, MinAreaOrange);
             if (result.found) return (true, result.cx, result.cy, 1, result.mask);
             result.mask.Dispose();
 
-            // 6. BLACK -> teaType 2
-            result = TryDetect(hsv, _lowerBlack, _upperBlack, MinAreaBlack);
+            // 4. CARDBOARD -> teaType 2
+            result = TryDetect(hsv, _lowerCardboard, _upperCardboard, MinAreaCardboard);
             if (result.found) return (true, result.cx, result.cy, 2, result.mask);
             result.mask.Dispose();
 
-            // 7. PURPLE -> teaType 2
-            result = TryDetect(hsv, _lowerPurple, _upperPurple, MinAreaPurple);
-            if (result.found) return (true, result.cx, result.cy, 2, result.mask);
+            // 5. WHITE -> teaType 1
+            result = TryDetect(hsv, _lowerWhite, _upperWhite, MinAreaWhite);
+            if (result.found) return (true, result.cx, result.cy, 1, result.mask);
 
             return (false, 0, 0, 0, result.mask);
         }
@@ -1795,9 +1774,9 @@ namespace BoxDetect
         static void Main(string[] args)
         {
             Console.WriteLine("=== Stereo Vision: Hierarchical Color Detection ===");
-            Console.WriteLine("Priority: white > cardboard > red > green > orange > black > purple");
-            Console.WriteLine("teaType 1 (green cat): white, green, orange");
-            Console.WriteLine("teaType 2 (red cat):   cardboard, red, black, purple\n");
+            Console.WriteLine("Priority: green > red > orange > cardboard > white");
+            Console.WriteLine("teaType 1 (green cat): green, orange, white");
+            Console.WriteLine("teaType 2 (red cat):   red, cardboard\n");
 
             var colorDetector = new ColorDetector();
 
