@@ -1732,7 +1732,7 @@ namespace BoxDetect
         // 0.0 = no masking. 0.20 = block out 20% from every edge (a smaller centered
         // region remains visible - roughly 60% width x 60% height in the middle).
         // Adjust this value to tune how much of the edges gets ignored by color detection.
-        static double EdgeMaskPercent = 0.0;
+        static double EdgeMaskPercent = 0.1;
 
         // Blacks out the left, right, top, and bottom edges of the frame in-place.
         // Percent is per-side: 0.20 means 20% blocked on EACH of the 4 sides (not 20% total).
