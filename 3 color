@@ -163,16 +163,23 @@ namespace BoxDetect
     // Combines Red+Orange into one "Reddish" family, and White+Cardboard into
     // one "Light" family. Green stays standalone.
     //
+    // RECTANGLE-FIT MASK CLEANUP:
+    // Candy boxes (Skittles, Mike & Ike, etc.) have noisy packaging art that
+    // produces swiss-cheese HSV masks. Instead of relying on morphological
+    // close to bridge gaps, we:
+    //   1. Do a light open to kill single-pixel noise
+    //   2. Heavy dilate to merge nearby color fragments into clusters
+    //   3. For each cluster, go back to the ORIGINAL mask pixels
+    //   4. Fit a minAreaRect to those pixels (finds the candy box shape)
+    //   5. Filter by aspect ratio (real boxes are ~1.3:1 to 4:1)
+    //   6. Fill the fitted rectangle onto a clean mask
+    // This turns fragmented color patches into solid filled rectangles that
+    // match the actual box outline, giving clean centroids for pick-and-place.
+    //
     // NOISE-PREVENTION APPROACH:
     // Each family is built by bitwise-OR-ing the ORIGINAL, already-tight HSV
     // masks -- NOT by widening a single continuous HSV range to span the gap
-    // between them. Widening the range would sweep in the dead zone between the
-    // two colors (e.g. H 9-11 between red/orange, or S 25-60 between
-    // white/cardboard), which is exactly where background noise, camera drift,
-    // and ambiguous mixed-lighting pixels live. OR-ing two pre-tuned strict
-    // masks means a pixel only counts if it ALREADY passed one of the two
-    // original strict filters -- no new coverage is added, so no new noise
-    // source is introduced.
+    // between them.
     //
     // Priority order (first match wins):
     //   1. GREEN     -> teaType 1
@@ -192,7 +199,7 @@ namespace BoxDetect
         // ---- GREEN (unchanged, standalone) ----
         private readonly Scalar _lowerGreen = new Scalar(35, 60, 40);
         private readonly Scalar _upperGreen = new Scalar(90, 255, 255);
-        private const int MinAreaGreen = 1500;
+        private const int MinAreaGreen = 800;
 
         // ---- RED (original tight range - one half of "Reddish") ----
         private readonly Scalar _lowerRed1 = new Scalar(0, 150, 60);
@@ -204,8 +211,8 @@ namespace BoxDetect
         private readonly Scalar _lowerOrange = new Scalar(12, 150, 100);
         private readonly Scalar _upperOrange = new Scalar(22, 255, 255);
 
-        // Combined "Reddish" family MinArea.
-        private const int MinAreaReddish = 1500;
+        // Combined "Reddish" family MinArea (lowered for candy boxes).
+        private const int MinAreaReddish = 800;
 
         // ---- CARDBOARD (original tight range - one half of "Light") ----
         private readonly Scalar _lowerCardboard = new Scalar(8, 60, 80);
@@ -215,12 +222,34 @@ namespace BoxDetect
         private readonly Scalar _lowerWhite = new Scalar(0, 0, 230);
         private readonly Scalar _upperWhite = new Scalar(179, 25, 255);
 
-        // Combined "Light" family MinArea. Cardboard/White boxes run smaller
-        // (1/4-1/2 the area of red/green/orange boxes) so keep this low.
-        private const int MinAreaLight = 2000;
+        // Combined "Light" family MinArea (lowered for candy boxes).
+        private const int MinAreaLight = 1200;
 
         // Legacy field kept for backward compatibility - no longer used internally
-        public int MinArea { get; set; } = 1500;
+        public int MinArea { get; set; } = 800;
+
+        // ==== RECTANGLE-FIT TUNING CONSTANTS ====
+        // Dilation kernel size for merging nearby color fragments into clusters.
+        // Larger = more aggressive merging (bridges bigger gaps between fragments).
+        // If candy box fragments are not merging into one cluster, increase this.
+        private const int RectifyDilateSize = 31;
+
+        // Number of dilation iterations. More iterations = larger merge radius.
+        private const int RectifyDilateIterations = 2;
+
+        // Minimum number of original-mask pixels in a cluster to consider it.
+        // Filters out tiny noise clusters. Lower = more sensitive to small objects.
+        private const int RectifyMinPixels = 100;
+
+        // Aspect ratio bounds for fitted rectangles.
+        // Candy boxes are roughly 1.3:1 to 4:1 (length:width).
+        // Reject anything outside this range as noise (too square = blob, too thin = edge artifact).
+        private const float RectifyMinAspect = 1.2f;
+        private const float RectifyMaxAspect = 5.0f;
+
+        // Minimum short-side length (pixels) of fitted rectangle.
+        // Filters out tiny slivers that pass the aspect ratio check.
+        private const float RectifyMinShortSide = 15f;
 
         /// <summary>
         /// Detect the highest-priority color family present in the frame.
@@ -258,38 +287,128 @@ namespace BoxDetect
             return (false, 0, 0, 0, lightResult.mask);
         }
 
-        // Single-range detection with per-color min area
+        // Single-range detection with rectangle-fit mask cleanup
         private (bool found, float cx, float cy, Mat mask) TryDetect(Mat hsv, Scalar lower, Scalar upper, int minArea)
         {
-            var mask = new Mat();
-            Cv2.InRange(hsv, lower, upper, mask);
-            ApplyMorphology(mask);
+            using var rawMask = new Mat();
+            Cv2.InRange(hsv, lower, upper, rawMask);
+            var mask = RectifyMask(rawMask);
             var (found, cx, cy, _) = FindLargestContour(mask, minArea);
             return (found, cx, cy, mask);
         }
 
-        // Merged-family detection: OR together N independently-tight HSV sub-ranges.
-        // Each pixel must pass ITS OWN strict thresholds via InRange individually;
-        // the resulting binary masks are then OR'd. No new HSV coverage is added
-        // beyond what the original individual colors already captured.
+        // Merged-family detection with rectangle-fit mask cleanup:
+        // OR together N independently-tight HSV sub-ranges, then rectify.
         private (bool found, float cx, float cy, Mat mask) TryDetectMergedFamily(
             Mat hsv, (Scalar lower, Scalar upper)[] ranges, int minArea)
         {
-            var mask = new Mat(hsv.Size(), MatType.CV_8UC1, Scalar.All(0));
+            using var rawMask = new Mat(hsv.Size(), MatType.CV_8UC1, Scalar.All(0));
 
             foreach (var (lower, upper) in ranges)
             {
                 using var subMask = new Mat();
                 Cv2.InRange(hsv, lower, upper, subMask);
-                Cv2.BitwiseOr(mask, subMask, mask);
+                Cv2.BitwiseOr(rawMask, subMask, rawMask);
             }
 
-            ApplyMorphology(mask);
+            var mask = RectifyMask(rawMask);
             var (found, cx, cy, _) = FindLargestContour(mask, minArea);
             return (found, cx, cy, mask);
         }
 
-        // Clean up mask: remove noise, fill holes, re-binarize
+        /// <summary>
+        /// Rectangle-fit mask cleanup.
+        /// Takes a noisy HSV mask (swiss-cheese from packaging art) and produces
+        /// a clean mask with solid filled rectangles where candy boxes are.
+        ///
+        /// Pipeline:
+        ///   1. Light morphological open to remove single-pixel specks
+        ///   2. Heavy dilation to merge nearby color fragments into clusters
+        ///   3. Find contours on the dilated mask (each = one cluster)
+        ///   4. For each cluster, go back to ORIGINAL denoised mask pixels
+        ///   5. Fit minAreaRect to those original pixels
+        ///   6. Filter by aspect ratio (reject non-rectangular noise)
+        ///   7. Fill the fitted rotated rectangle onto a clean output mask
+        /// </summary>
+        private Mat RectifyMask(Mat rawMask)
+        {
+            // Step 1: Light open to kill single-pixel noise specks
+            using var denoised = new Mat();
+            using var openKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(5, 5));
+            Cv2.MorphologyEx(rawMask, denoised, MorphTypes.Open, openKernel);
+
+            // Step 2: Heavy dilation to merge nearby fragments into clusters.
+            // This bridges gaps between scattered color patches on the same box.
+            using var dilateKernel = Cv2.GetStructuringElement(MorphShapes.Ellipse,
+                new Size(RectifyDilateSize, RectifyDilateSize));
+            using var dilated = new Mat();
+            Cv2.Dilate(denoised, dilated, dilateKernel, iterations: RectifyDilateIterations);
+
+            // Step 3: Find cluster contours on the dilated mask
+            Cv2.FindContours(dilated, out Point[][] clusters, out _,
+                RetrievalModes.External, ContourApproximationModes.ApproxSimple);
+
+            // Output: clean mask with filled rectangles
+            var cleanMask = new Mat(rawMask.Size(), MatType.CV_8UC1, Scalar.All(0));
+
+            foreach (var cluster in clusters)
+            {
+                if (Cv2.ContourArea(cluster) < RectifyMinPixels) continue;
+
+                // Step 4: Go back to ORIGINAL denoised mask pixels within this cluster.
+                // Create a filled mask for this cluster's dilated region.
+                using var clusterRegion = new Mat(rawMask.Size(), MatType.CV_8UC1, Scalar.All(0));
+                Cv2.DrawContours(clusterRegion, new[] { cluster }, 0, Scalar.White, Cv2.FILLED);
+
+                // AND with denoised original to isolate real color pixels in this cluster
+                using var realPixels = new Mat();
+                Cv2.BitwiseAnd(denoised, clusterRegion, realPixels);
+
+                // Collect non-zero points (the actual colored pixels)
+                var nonZero = new Mat();
+                Cv2.FindNonZero(realPixels, nonZero);
+                if (nonZero.Empty() || nonZero.Rows < RectifyMinPixels)
+                {
+                    nonZero.Dispose();
+                    continue;
+                }
+
+                // Convert to Point2f array for MinAreaRect
+                int count = nonZero.Rows;
+                var points = new Point2f[count];
+                for (int i = 0; i < count; i++)
+                {
+                    var pt = nonZero.At<Point>(i, 0);
+                    points[i] = new Point2f(pt.X, pt.Y);
+                }
+                nonZero.Dispose();
+
+                // Step 5: Fit minimum-area rotated rectangle to the original pixels
+                var rect = Cv2.MinAreaRect(points);
+
+                // Step 6: Aspect ratio filter — reject non-rectangular shapes
+                float longSide = Math.Max(rect.Size.Width, rect.Size.Height);
+                float shortSide = Math.Min(rect.Size.Width, rect.Size.Height);
+
+                if (shortSide < RectifyMinShortSide) continue;
+
+                float aspect = longSide / shortSide;
+                if (aspect > RectifyMaxAspect) continue;
+                // Note: we intentionally do NOT filter on RectifyMinAspect here
+                // because a square-ish cluster could be a box seen head-on.
+                // The aspect filter only rejects implausibly thin slivers.
+
+                // Step 7: Fill the fitted rotated rectangle onto clean mask
+                var vertices = Cv2.BoxPoints(rect);
+                var intVertices = vertices.Select(v => new Point((int)v.X, (int)v.Y)).ToArray();
+                Cv2.FillConvexPoly(cleanMask, intVertices, Scalar.White);
+            }
+
+            return cleanMask;
+        }
+
+        // Legacy morphology method — kept for backward compatibility.
+        // No longer called by the main detection pipeline (replaced by RectifyMask).
         private void ApplyMorphology(Mat mask)
         {
             using var openKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(5, 5));
@@ -335,7 +454,8 @@ namespace BoxDetect
         }
 
         // Green-only detection (for hand-eye calibration - uses green pattern object)
-        // Intentionally scoped to green only, ignoring the "Light" family even though they share teaType 1
+        // Uses legacy ApplyMorphology since calibration uses a solid green object,
+        // not noisy candy packaging.
         public (bool found, float cx, float cy, Mat mask) DetectGreen(Mat frame)
         {
             using var blurred = new Mat();
@@ -344,8 +464,11 @@ namespace BoxDetect
             using var hsv = new Mat();
             Cv2.CvtColor(blurred, hsv, ColorConversionCodes.BGR2HSV);
 
-            var result = TryDetect(hsv, _lowerGreen, _upperGreen, MinAreaGreen);
-            return (result.found, result.cx, result.cy, result.mask);
+            var mask = new Mat();
+            Cv2.InRange(hsv, _lowerGreen, _upperGreen, mask);
+            ApplyMorphology(mask);
+            var (found, cx, cy, _) = FindLargestContour(mask, MinAreaGreen);
+            return (found, cx, cy, mask);
         }
     }
 
@@ -1781,7 +1904,8 @@ namespace BoxDetect
             Console.WriteLine("=== Stereo Vision: Hierarchical Color Detection ===");
             Console.WriteLine("Priority: green > reddish(red+orange) > light(white+cardboard)");
             Console.WriteLine("teaType 1: green, light(white+cardboard)");
-            Console.WriteLine("teaType 2: reddish(red+orange)\n");
+            Console.WriteLine("teaType 2: reddish(red+orange)");
+            Console.WriteLine("Mode: Rectangle-fit mask cleanup for candy box detection\n");
 
             var colorDetector = new ColorDetector();
 
